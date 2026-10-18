@@ -18,7 +18,11 @@ export default function Home() {
     try {
       const res = await fetch(`/api/ballot?raw=1&address=${encodeURIComponent(address)}`);
       const data = await res.json();
-      if (!res.ok) setError(data.error ?? "Something went wrong.");
+      if (!res.ok)
+        setError(
+          (data.error ?? "Something went wrong.") +
+            (data.detail ? ` (Google says: ${data.detail})` : "")
+        );
       else setBallot(data);
     } catch {
       setError("Couldn't reach the server.");

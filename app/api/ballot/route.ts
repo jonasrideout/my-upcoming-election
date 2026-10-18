@@ -37,6 +37,17 @@ export type BallotResponse = {
   raw?: unknown;
 };
 
+const ELECTIONS_URL = "https://www.googleapis.com/civicinfo/v2/elections";
+
+function friendlyError(msg: string): string {
+  if (/parse address/i.test(msg)) return "We couldn't read that address. Try including city and state.";
+  if (/API key|permission|disabled/i.test(msg))
+    return "The API key isn't working. Check that the Civic Information API is enabled for it.";
+  if (/election unknown|no information|no contests/i.test(msg))
+    return "No upcoming election data found for that address yet.";
+  return "Couldn't look up that address.";
+}
+
 function slug(s: string) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
@@ -64,27 +75,58 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const url = new URL(VOTERINFO_URL);
-  url.searchParams.set("address", address);
-  url.searchParams.set("key", key);
-  // No electionId → Google returns the next upcoming election for this address.
-
-  let data: any;
+  // 1. Ask Google which elections it currently has data for.
+  //    ID 2000 is Google's permanent test election, so skip it.
+  let upcoming: { id: string; name: string; electionDay: string }[] = [];
   try {
-    const res = await fetch(url, { cache: "no-store" });
-    data = await res.json();
-    if (!res.ok) {
-      const msg: string = data?.error?.message ?? "";
-      let friendly = "Couldn't look up that address.";
-      if (/parse address/i.test(msg)) friendly = "We couldn't read that address. Try including city and state.";
-      else if (/election unknown|no information/i.test(msg))
-        friendly = "No upcoming election data found for that address yet.";
-      else if (/API key|permission|disabled/i.test(msg))
-        friendly = "The API key isn't working. Check that the Civic Information API is enabled for it.";
-      return NextResponse.json({ error: friendly, detail: msg }, { status: res.status });
+    const er = await fetch(`${ELECTIONS_URL}?key=${encodeURIComponent(key)}`, { cache: "no-store" });
+    const ej = await er.json();
+    if (!er.ok) {
+      const msg: string = ej?.error?.message ?? "";
+      return NextResponse.json({ error: friendlyError(msg), detail: msg }, { status: er.status });
     }
-  } catch (e) {
+    const today = new Date().toISOString().slice(0, 10);
+    upcoming = (ej.elections ?? [])
+      .filter((e: any) => e.id !== "2000" && e.electionDay >= today)
+      .sort((a: any, b: any) => a.electionDay.localeCompare(b.electionDay));
+  } catch {
     return NextResponse.json({ error: "Network error reaching Google." }, { status: 502 });
+  }
+
+  // 2. Try the default lookup first, then each upcoming election by ID,
+  //    and keep the first one that actually returns races for this address.
+  const attempts: (string | null)[] = [null, ...upcoming.map((e) => e.id)];
+  const tried: { electionId: string | null; detail: string }[] = [];
+  let data: any = null;
+
+  for (const electionId of attempts) {
+    const url = new URL(VOTERINFO_URL);
+    url.searchParams.set("address", address);
+    url.searchParams.set("key", key);
+    if (electionId) url.searchParams.set("electionId", electionId);
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      const json = await res.json();
+      if (res.ok && (json.contests?.length ?? 0) > 0) {
+        data = json;
+        break;
+      }
+      const msg: string = res.ok ? "Election found but no contests returned" : json?.error?.message ?? "";
+      tried.push({ electionId, detail: msg });
+      // A bad address or bad key won't get better with another election ID.
+      if (/parse address|API key|permission|disabled/i.test(msg)) break;
+      if (res.ok && !data) data = json; // keep as fallback (election info, no contests)
+    } catch {
+      tried.push({ electionId, detail: "Network error" });
+    }
+  }
+
+  if (!data) {
+    const lastDetail = tried[tried.length - 1]?.detail ?? "";
+    return NextResponse.json(
+      { error: friendlyError(lastDetail), detail: lastDetail, availableElections: upcoming, tried },
+      { status: 404 }
+    );
   }
 
   const contests: Contest[] = (data.contests ?? []).map((c: any, i: number): Contest => {
